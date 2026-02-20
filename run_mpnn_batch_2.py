@@ -1,142 +1,255 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ProteinMPNN batch design with automatic epitope locking.
+
+Instead of hardcoding CDR sequences, this script reads the epitope PDB files
+directly and builds the sequence dictionary automatically. During design, all
+grafted epitope regions are fixed (locked), and only the scaffold regions are
+allowed to mutate.
+
+Usage:
+    python proteinmpnn_design.py input_dir output_dir --epitopes_dir Epitopes/
+
+    # With all options:
+    python proteinmpnn_design.py Grafts_optimized/final_pdbs/ MPNN_out/ \\
+        --epitopes_dir Epitopes/ \\
+        --chain A \\
+        --num_seq 10 \\
+        --temp 0.2 \\
+        --model v_48_020 \\
+        --mpnn_script /path/to/protein_mpnn_run.py
+"""
+
 import os
 import argparse
 import glob
 import subprocess
 import sys
 import json
-from Bio.PDB import PDBParser
-from Bio.SeqUtils import seq1
 import warnings
+from Bio.PDB import PDBParser, PPBuilder
+from Bio.SeqUtils import seq1
 
-# Suppress BioPython warnings
-warnings.simplefilter('ignore')
+warnings.simplefilter("ignore")
 
-# Dictionary of CDRs
-CDRs_DICTIONARY = {
-    "H1": "KLDII",
-    "H2": "IKFTIKFQEFSPNLWGLEFQKNKDYYII",
-    "H3": "KILMKV"
-}
 
-# --- Helper Functions ---
-
-def get_chain_sequence_and_indices(chain):
+# ─────────────────────────────────────────────
+# BUILD EPITOPE DICTIONARY FROM PDB FILES
+# ─────────────────────────────────────────────
+def extract_sequence_from_pdb(pdb_path):
     """
-    Extracts sequence from a Bio.PDB chain.
+    Reads a PDB file and returns the full amino acid sequence
+    of the first chain found (1-letter codes).
+    Uses PPBuilder to handle multi-residue chains correctly.
     """
-    # Filter only amino acid residues (ignore waters/hetero)
-    residues = [res for res in chain.get_residues() if res.get_id()[0] == ' ']
-    sequence = seq1(''.join(res.resname for res in residues))
-    return sequence
+    parser  = PDBParser(QUIET=True)
+    name    = os.path.splitext(os.path.basename(pdb_path))[0]
+    structure = parser.get_structure(name, pdb_path)
+    model   = structure[0]
 
-def get_formatted_fixed_indices(scaffold_sequence, cdr_dict):
+    ppb = PPBuilder()
+    sequences = []
+    for pp in ppb.build_peptides(model):
+        sequences.append(str(pp.get_sequence()))
+
+    if not sequences:
+        # Fallback: manual extraction if PPBuilder finds nothing
+        for chain in model:
+            residues = [r for r in chain.get_residues() if r.get_id()[0] == " "]
+            seq = seq1("".join(r.resname for r in residues))
+            if seq:
+                sequences.append(seq)
+            break  # only first chain
+
+    return "".join(sequences) if sequences else None
+
+
+def build_epitope_dictionary(epitopes_dir):
     """
-    Finds CDR indices in the sequence and returns 1-based list.
+    Reads all PDB files in epitopes_dir and builds a dictionary:
+        { epitope_name : sequence }
+
+    This replaces the hardcoded CDRs_DICTIONARY.
+    The epitope name is the filename without extension.
+
+    Returns the dictionary and prints a summary.
     """
-    all_fixed_indices = []
-    
-    for cdr_name, cdr_sequence in cdr_dict.items():
-        start_index = scaffold_sequence.find(cdr_sequence)
-        
-        if start_index != -1:
-            # start_index is 0-based.
-            end_position = start_index + len(cdr_sequence)
-            # Convert to 1-based for ProteinMPNN (range excludes end, so +1 is implicit in logic)
-            # We want indices: start+1, start+2... end
-            indices_list = [i + 1 for i in range(start_index, end_position)]
-            all_fixed_indices.extend(indices_list)
-            print(f"      -> Found {cdr_name} at pos {start_index+1}-{end_position}")
+    pdb_files = sorted(glob.glob(os.path.join(epitopes_dir, "*.pdb")))
+
+    if not pdb_files:
+        raise FileNotFoundError(
+            f"No PDB files found in epitopes directory: {epitopes_dir}"
+        )
+
+    epitope_dict = {}
+    print(f"\nBuilding epitope dictionary from {len(pdb_files)} PDB files...")
+
+    for pdb_path in pdb_files:
+        name = os.path.splitext(os.path.basename(pdb_path))[0]
+        seq  = extract_sequence_from_pdb(pdb_path)
+
+        if seq:
+            epitope_dict[name] = seq
+            print(f"  [{name}]  {seq}  ({len(seq)} aa)")
         else:
-            print(f"      -> WARNING: CDR '{cdr_name}' not found in sequence.")
+            print(f"  WARNING: Could not extract sequence from {pdb_path} — skipping.")
 
-    return sorted(list(set(all_fixed_indices)))
+    print(f"  → {len(epitope_dict)} epitopes loaded.\n")
+    return epitope_dict
 
-def create_fixed_positions_jsonl(pdb_path, output_dir, target_chain_id):
+
+# ─────────────────────────────────────────────
+# SEQUENCE & INDEX UTILITIES
+# ─────────────────────────────────────────────
+def get_chain_sequence(chain):
+    """Extracts the 1-letter amino acid sequence from a Bio.PDB chain."""
+    residues = [r for r in chain.get_residues() if r.get_id()[0] == " "]
+    return seq1("".join(r.resname for r in residues))
+
+
+def find_epitope_indices(scaffold_sequence, epitope_dict):
     """
-    Generates JSONL defining rules:
-    - Target Chain (e.g., B): Fix ONLY the CDRs.
-    - Other Chains (e.g., A): Fix EVERYTHING (protect the antigen).
+    Searches for each epitope sequence as a substring of the scaffold sequence.
+    Returns a sorted list of 1-based residue indices that belong to any epitope.
+
+    If an epitope is not found, a warning is printed but execution continues —
+    it may mean that epitope was not grafted into this particular scaffold.
     """
-    pdb_filename = os.path.basename(pdb_path)
+    all_fixed = []
+
+    for epitope_name, epitope_seq in epitope_dict.items():
+        start = scaffold_sequence.find(epitope_seq)
+
+        if start != -1:
+            end     = start + len(epitope_seq)
+            indices = [i + 1 for i in range(start, end)]  # convert to 1-based
+            all_fixed.extend(indices)
+            print(f"      -> Locked [{epitope_name}] at positions {start+1}–{end} "
+                  f"({len(indices)} residues)")
+        else:
+            # Not a hard error: this epitope may not be present in this scaffold
+            print(f"      -> [{epitope_name}] not found in chain — skipping.")
+
+    fixed = sorted(set(all_fixed))
+    return fixed
+
+
+# ─────────────────────────────────────────────
+# JSONL GENERATION
+# ─────────────────────────────────────────────
+def create_fixed_positions_jsonl(pdb_path, output_dir, target_chain_id, epitope_dict):
+    """
+    Generates a JSONL file defining which residues are fixed for ProteinMPNN:
+
+    - Target chain (e.g., A): fix ONLY the grafted epitope regions.
+      Everything else on this chain is free to be redesigned.
+    - Other chains (e.g., context/antigen): fix ENTIRELY to protect them.
+
+    Returns the path to the generated JSONL, or None on failure.
+    """
+    pdb_filename  = os.path.basename(pdb_path)
     pdb_name_base = os.path.splitext(pdb_filename)[0]
-    
+
     parser = PDBParser(QUIET=True)
     try:
         structure = parser.get_structure(pdb_name_base, pdb_path)
-        model = structure[0]
+        model     = structure[0]
     except Exception as e:
-        print(f"   -> ERROR reading structure {pdb_path}: {e}")
+        print(f"   -> ERROR reading {pdb_path}: {e}")
+        return None
+
+    chain_ids = [c.get_id() for c in model]
+    if target_chain_id not in chain_ids:
+        print(f"   -> ERROR: chain '{target_chain_id}' not found. "
+              f"Available: {chain_ids}")
         return None
 
     chain_definitions = {}
-    
-    # Check if target chain exists in structure
-    chain_ids_in_structure = [c.get_id() for c in model]
-    if target_chain_id not in chain_ids_in_structure:
-        print(f"   -> ERROR: Target chain '{target_chain_id}' not found in PDB. Available chains: {chain_ids_in_structure}")
-        return None
 
     for chain in model:
         chain_id = chain.get_id()
-        seq = get_chain_sequence_and_indices(chain)
-        
+        seq      = get_chain_sequence(chain)
+
         if not seq:
             continue
 
         if chain_id == target_chain_id:
-            # === TARGET CHAIN (Binder) ===
-            # Fix only CDRs
-            fixed_indices = get_formatted_fixed_indices(seq, CDRs_DICTIONARY)
+            # Design chain: lock only the epitope residues
+            fixed_indices = find_epitope_indices(seq, epitope_dict)
+
+            if not fixed_indices:
+                print(f"      Chain {chain_id} (Design): No epitopes found — "
+                      f"all {len(seq)} residues are free to mutate.")
+            else:
+                free = len(seq) - len(fixed_indices)
+                print(f"      Chain {chain_id} (Design): "
+                      f"{len(fixed_indices)} residues locked (epitopes), "
+                      f"{free} free to mutate.")
+
             chain_definitions[chain_id] = fixed_indices
-            print(f"      Chain {chain_id} (Target): Fixed {len(fixed_indices)} residues (CDRs).")
+
         else:
-            # === CONTEXT CHAINS (Antigen) ===
-            # Fix everything
+            # Context chain: lock entirely
             fixed_indices = list(range(1, len(seq) + 1))
             chain_definitions[chain_id] = fixed_indices
-            print(f"      Chain {chain_id} (Context): Fixed completely ({len(seq)} residues).")
+            print(f"      Chain {chain_id} (Context): fully locked ({len(seq)} residues).")
 
-    final_output = {
-        pdb_name_base: chain_definitions
-    }
+    final_output = {pdb_name_base: chain_definitions}
 
-    jsonl_temp_dir = os.path.join(output_dir, "fixed_pos_jsonl_temp")
-    os.makedirs(jsonl_temp_dir, exist_ok=True)
-    jsonl_path = os.path.join(jsonl_temp_dir, f"{pdb_name_base}.jsonl")
-    
+    jsonl_dir  = os.path.join(output_dir, "fixed_pos_jsonl_temp")
+    os.makedirs(jsonl_dir, exist_ok=True)
+    jsonl_path = os.path.join(jsonl_dir, f"{pdb_name_base}.jsonl")
+
     try:
-        with open(jsonl_path, 'w') as f:
-            f.write(json.dumps(final_output) + '\n')
+        with open(jsonl_path, "w") as f:
+            f.write(json.dumps(final_output) + "\n")
         return jsonl_path
     except Exception as e:
-        print(f"   -> ERROR saving JSONL: {e}")
+        print(f"   -> ERROR writing JSONL: {e}")
         return None
 
-# --- Main Execution ---
-def run_proteinmpnn_batch(input_dir, output_dir, mpnn_script_path, num_sequences, model_name, sampling_temp, chain_id):
-    
+
+# ─────────────────────────────────────────────
+# MAIN BATCH RUNNER
+# ─────────────────────────────────────────────
+def run_proteinmpnn_batch(
+    input_dir, output_dir, epitopes_dir,
+    mpnn_script_path, num_sequences,
+    model_name, sampling_temp, chain_id
+):
     os.makedirs(output_dir, exist_ok=True)
-    pdb_files = glob.glob(os.path.join(input_dir, "*.pdb"))
-    
+
+    # Build epitope dictionary once — reused for all scaffolds
+    epitope_dict = build_epitope_dictionary(epitopes_dir)
+
+    pdb_files = sorted(glob.glob(os.path.join(input_dir, "*.pdb")))
     if not pdb_files:
         print(f"No PDB files found in: {input_dir}")
         return
 
-    print(f"Starting processing of {len(pdb_files)} PDB files...")
-    print(f"Target Chain for Design: {chain_id}")
+    print(f"Processing {len(pdb_files)} PDB files...")
+    print(f"Target chain for design : {chain_id}")
+    print(f"Epitopes to lock        : {list(epitope_dict.keys())}\n")
+
+    success = 0
+    failed  = 0
 
     for i, pdb_path in enumerate(pdb_files):
         pdb_filename = os.path.basename(pdb_path)
-        print(f"\n[{i+1}/{len(pdb_files)}] Processing {pdb_filename}...")
-        
-        # 1. Generate JSONL
-        fixed_pos_jsonl_path = create_fixed_positions_jsonl(pdb_path, output_dir, chain_id)
-        
-        if not fixed_pos_jsonl_path:
+        print(f"\n[{i+1}/{len(pdb_files)}] {pdb_filename}")
+
+        # 1. Generate JSONL with fixed positions
+        jsonl_path = create_fixed_positions_jsonl(
+            pdb_path, output_dir, chain_id, epitope_dict
+        )
+
+        if not jsonl_path:
             print("   -> Skipping: JSONL generation failed.")
+            failed += 1
             continue
 
-        # 2. Build Command
+        # 2. Build ProteinMPNN command
         command = [
             sys.executable,
             mpnn_script_path,
@@ -147,48 +260,65 @@ def run_proteinmpnn_batch(input_dir, output_dir, mpnn_script_path, num_sequences
             f"--sampling_temp={sampling_temp}",
             "--seed=0",
             "--save_score=1",
-            "--batch_size=1" 
+            "--batch_size=1",
+            f"--fixed_positions_jsonl={jsonl_path}",
         ]
-        
-        if fixed_pos_jsonl_path:
-            command.append(f"--fixed_positions_jsonl={fixed_pos_jsonl_path}")
-        
-        # 3. Execute
+
+        # 3. Run
         try:
-            # We use capture_output=False so you can see ProteinMPNN progress bars in real time
-            subprocess.run(command, check=True, capture_output=False) 
-            print(f"   -> Success!")
-        except subprocess.CalledProcessError as e:
-            print(f"   -> ERROR running ProteinMPNN.")
+            subprocess.run(command, check=True, capture_output=False)
+            print(f"   -> Done.")
+            success += 1
+        except subprocess.CalledProcessError:
+            print(f"   -> ERROR: ProteinMPNN failed for {pdb_filename}.")
+            failed += 1
         except FileNotFoundError:
-            print(f"   -> CRITICAL ERROR: Script not found at {mpnn_script_path}")
+            print(f"   -> CRITICAL: Script not found at {mpnn_script_path}")
             break
 
-    print("\nBatch processing complete.")
+    print(f"\n{'='*50}")
+    print(f"Batch complete.  Success: {success}  |  Failed: {failed}")
+    print(f"{'='*50}")
 
+
+# ─────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run ProteinMPNN fixing CDRs on a specific chain.",
+        description=__doc__,
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("input_dir", type=str, help="Input PDB folder")
-    parser.add_argument("output_dir", type=str, help="Output folder")
-    parser.add_argument("--mpnn_script", type=str, default="/home/joao/Downloads/RFdiffusion/ProteinMPNN/protein_mpnn_run.py", help="Path to protein_mpnn_run.py")
-    parser.add_argument("--num_seq", type=int, default=10, help="Sequences per target")
-    parser.add_argument("--model", type=str, default="v_48_020", help="Model name")
-    parser.add_argument("--temp", type=str, default="0.2", help="Sampling temperature")
-    
-    # NEW ARGUMENT: Chain ID (Defaults to B based on your PDB)
-    parser.add_argument("--chain", type=str, default="B", help="Target Chain ID to design (default: B)")
+    parser.add_argument("input_dir",  help="Folder with grafted PDB files to design")
+    parser.add_argument("output_dir", help="Output folder for ProteinMPNN results")
+
+    parser.add_argument(
+        "--epitopes_dir", required=True,
+        help="Folder containing the original epitope PDB files.\n"
+             "Sequences are extracted automatically and used to lock those\n"
+             "regions during design."
+    )
+    parser.add_argument(
+        "--mpnn_script",
+        default="/home/joao/Downloads/RFdiffusion/ProteinMPNN/protein_mpnn_run.py",
+        help="Path to protein_mpnn_run.py"
+    )
+    parser.add_argument("--num_seq", type=int,   default=10,      help="Sequences per target")
+    parser.add_argument("--model",   type=str,   default="v_48_020", help="ProteinMPNN model name")
+    parser.add_argument("--temp",    type=str,   default="0.2",   help="Sampling temperature")
+    parser.add_argument("--chain",   type=str,   default="A",     help="Chain ID to design (default: A)")
 
     args = parser.parse_args()
 
     run_proteinmpnn_batch(
-        args.input_dir, 
-        args.output_dir, 
-        args.mpnn_script, 
-        args.num_seq, 
-        args.model, 
-        args.temp,
-        args.chain # Pass the chain argument
+        input_dir        = args.input_dir,
+        output_dir       = args.output_dir,
+        epitopes_dir     = args.epitopes_dir,
+        mpnn_script_path = args.mpnn_script,
+        num_sequences    = args.num_seq,
+        model_name       = args.model,
+        sampling_temp    = args.temp,
+        chain_id         = args.chain,
     )
+    
+    

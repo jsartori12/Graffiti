@@ -21,6 +21,7 @@ Saídas:
 import os
 import csv
 import glob
+import random
 from datetime import datetime
 from collections import defaultdict
 import matplotlib
@@ -84,29 +85,15 @@ def find_overlaps(motif_records, buffer=0):
 # ─────────────────────────────────────────────
 # SELEÇÃO GREEDY (maximiza motifs compatíveis)
 # ─────────────────────────────────────────────
-def greedy_select(motif_records, buffer=0):
+def greedy_one_pass(motif_records, buffer=0):
     """
-    Algoritmo greedy para selecionar o máximo de motifs sem sobreposição:
-
-    1. Ordena os motifs pelo tamanho do range (menor primeiro)
-       → favorece motifs menores que "ocupam menos espaço"
-    2. Itera: aceita o próximo motif se não sobrepõe com nenhum já aceito
-    3. Registra os rejeitados e com qual motif conflitaram
-
-    Retorna:
-      selected : lista de records aceitos
-      rejected : lista de dicts {record, conflict_with}
+    Executa um único passo greedy na ordem em que os records chegam.
+    Retorna (selected, rejected).
     """
-    # Ordenar por tamanho do range (menor = menos invasivo)
-    sorted_records = sorted(
-        motif_records,
-        key=lambda r: r["scaffold_range_end"] - r["scaffold_range_start"]
-    )
-
     selected = []
     rejected = []
 
-    for candidate in sorted_records:
+    for candidate in motif_records:
         conflict = None
         for accepted in selected:
             if ranges_overlap(
@@ -120,12 +107,101 @@ def greedy_select(motif_records, buffer=0):
         if conflict is None:
             selected.append(candidate)
         else:
-            rejected.append({
-                "record":        candidate,
-                "conflict_with": conflict,
-            })
+            rejected.append({"record": candidate, "conflict_with": conflict})
 
     return selected, rejected
+
+
+def greedy_select(motif_records, buffer=0, n_random_trials=100000, seed=42):
+    """
+    Seleção greedy com busca por múltiplas permutações aleatórias.
+
+    Estratégias testadas:
+      1. Menor range primeiro  (determinístico — baseline original)
+      2. Maior range primeiro  (determinístico — favorece motifs grandes)
+      3. n_random_trials permutações aleatórias embaralhadas
+
+    A melhor solução encontrada (maior n_selected, desempate pelo
+    menor n_rejected) é retornada.
+
+    Parâmetros
+    ----------
+    motif_records   : lista de records do scaffold
+    buffer          : margem de segurança entre ranges (resíduos)
+    n_random_trials : número de permutações aleatórias a testar
+    seed            : semente para reprodutibilidade (None = aleatório puro)
+    """
+    rng = random.Random(seed)
+    best_selected = []
+    best_rejected = []
+    best_score    = -1          # maior n_selected é melhor
+
+    # ── Estratégia 1: menor range primeiro (baseline) ──
+    ordered = sorted(motif_records,
+                     key=lambda r: r["scaffold_range_end"] - r["scaffold_range_start"])
+    sel, rej = greedy_one_pass(ordered, buffer)
+    if len(sel) > best_score:
+        best_selected, best_rejected, best_score = sel, rej, len(sel)
+
+    # ── Estratégia 2: maior range primeiro ──
+    ordered = sorted(motif_records,
+                     key=lambda r: r["scaffold_range_end"] - r["scaffold_range_start"],
+                     reverse=True)
+    sel, rej = greedy_one_pass(ordered, buffer)
+    if len(sel) > best_score:
+        best_selected, best_rejected, best_score = sel, rej, len(sel)
+
+    # ── Estratégia 3: permutações aleatórias ──
+    shuffled = list(motif_records)
+    for _ in range(n_random_trials):
+        rng.shuffle(shuffled)
+        sel, rej = greedy_one_pass(shuffled, buffer)
+        if len(sel) > best_score:
+            best_selected, best_rejected, best_score = sel, rej, len(sel)
+
+    return best_selected, best_rejected
+# def greedy_select(motif_records, buffer=0):
+#     """
+#     Algoritmo greedy para selecionar o máximo de motifs sem sobreposição:
+
+#     1. Ordena os motifs pelo tamanho do range (menor primeiro)
+#        → favorece motifs menores que "ocupam menos espaço"
+#     2. Itera: aceita o próximo motif se não sobrepõe com nenhum já aceito
+#     3. Registra os rejeitados e com qual motif conflitaram
+
+#     Retorna:
+#       selected : lista de records aceitos
+#       rejected : lista de dicts {record, conflict_with}
+#     """
+#     # Ordenar por tamanho do range (menor = menos invasivo)
+#     sorted_records = sorted(
+#         motif_records,
+#         key=lambda r: r["scaffold_range_end"] - r["scaffold_range_start"]
+#     )
+
+#     selected = []
+#     rejected = []
+
+#     for candidate in sorted_records:
+#         conflict = None
+#         for accepted in selected:
+#             if ranges_overlap(
+#                 candidate["scaffold_range_start"], candidate["scaffold_range_end"],
+#                 accepted["scaffold_range_start"],  accepted["scaffold_range_end"],
+#                 buffer=buffer
+#             ):
+#                 conflict = accepted["motif_name"]
+#                 break
+
+#         if conflict is None:
+#             selected.append(candidate)
+#         else:
+#             rejected.append({
+#                 "record":        candidate,
+#                 "conflict_with": conflict,
+#             })
+
+#     return selected, rejected
 
 
 # ─────────────────────────────────────────────
