@@ -1,4 +1,7 @@
 # Graffiti (GRafting Algorithm For Finding, Incorporating and Tailoring Inserts)
+<div align="center">
+  <img src="grafiti-removebg-preview.png" width="400" />
+</div>
 ![Graffiti](grafiti-removebg-preview.png)
 
 A PyRosetta-based pipeline for multi-motif grafting onto protein scaffolds, with overlap optimization, SASA analysis, and structured logging.
