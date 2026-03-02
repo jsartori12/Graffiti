@@ -153,9 +153,9 @@ Filtering `region == MOTIF` isolates the SASA values of the grafted epitopes, wh
 
 | File | Description |
 |---|---|
-| `ranking_chart_*.png` | Stacked bar chart — motifs kept vs removed per scaffold (split into parts if >50 scaffolds) |
+
 | `distribution_chart_*.png` | Histogram of scaffolds by number of compatible motifs |
-| `overlap_heatmap_*.png` | Conflict matrix (motif × motif) for the scaffold with the most overlaps |
+
 
 ---
 
