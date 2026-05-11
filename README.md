@@ -1,20 +1,109 @@
-# Graffiti (GRafting Algorithm For Finding, Incorporating and Tailoring Inserts)
+# GRAFFITI
 <div align="center">
   <img src="grafiti-removebg-preview.png" width="400" />
 </div>
+**G**rafting **R**outine for **A**utomated **F**ragment **F**itting, **I**nsertion, and **T**argeted **I**mmunogenic epitopes
 
-A PyRosetta-based pipeline for multi-motif grafting onto protein scaffolds, with overlap optimization, SASA analysis, and structured logging.
+A PyRosetta pipeline for transplanting immunogenic epitopes onto protein scaffolds, with secondary-structure-aware grafting, SASA-based ranking, and ProteinMPNN sequence design.
 
 ---
 
 ## Overview
 
-This pipeline automates the process of grafting multiple epitope fragments (motifs) onto protein scaffolds using Rosetta's [MotifGraft](https://docs.rosettacommons.org/docs/latest/scripting_documentation/RosettaScripts/Movers/movers_pages/MotifGraftMover) algorithm. It is structured in two independent phases:
+GRAFFITI systematically tests every scaffold × epitope combination, resolves positional conflicts, selects top-performing scaffolds, and prepares sequences for structure prediction.
 
-- **Phase 1** — Tests every `(scaffold, motif)` pair independently and maps where each graft lands in the scaffold sequence.
-- **Phase 2** — Reads the Phase 1 map, detects overlapping grafts, selects the optimal non-overlapping combination per scaffold using a greedy algorithm, generates the final multi-motif PDB structures, and computes per-residue SASA for each final pose.
+```
+Scaffolds (PDB) ─┐
+                  ├─► Step 1: Graft ─► Step 2: Filter ─► Step 3: MPNN ─► [AF2] ─► Step 5: Analyse
+Epitopes  (PDB) ─┘
+```
 
-The goal is to find scaffolds that can accommodate the maximum number of epitopes simultaneously without structural conflicts, while providing quantitative metrics (graft position, SASA exposure) to support downstream design decisions.
+---
+
+## Pipeline Steps
+
+| Step | Script | Description |
+|------|--------|-------------|
+| 1 | `step1_paralel.py` | Parallel grafting of all scaffold × epitope pairs |
+| 2 | `step2.py` | Overlap resolution, SASA scoring, top scaffold selection |
+| 3 | `graffiti_run.py` | ProteinMPNN sequence design on selected scaffolds |
+| 4 | *(external)* | AlphaFold2 structure prediction |
+| 5 | `graffiti_run.py` | Post-AF2 analysis: pLDDT, RMSD, SASA per region |
+
+---
+
+## Secondary Structure-Aware Grafting
+
+Epitopes are classified by DSSP into **HELIX**, **SHEET**, **LOOP**, or **MIXED**. The classification drives two completely different grafting strategies:
+
+```
+                    ┌─────────────────────────────┐
+                    │   Scaffold + epitope PDB     │
+                    │   (one job per worker)       │
+                    └──────────────┬──────────────┘
+                                   │
+                    ┌──────────────▼──────────────┐
+                    │      DSSP classification     │
+                    │  Count H (helix), E (sheet), │
+                    │  L (coil) residues via DSSP  │
+                    └──────────────┬──────────────┘
+                                   │
+                      ┌────────────▼────────────┐
+                      │    ≥ 60% coil residues? │
+                      │   (LOOP_FRACTION = 0.6) │
+                      └──────┬──────────┬───────┘
+                          YES │          │ NO
+                              │          │
+               ┌──────────────▼─┐   ┌───▼──────────────────┐
+               │  LOOP epitope  │   │  HELIX / SHEET / MIXED│
+               └──────┬─────────┘   └───────────┬───────────┘
+                      │                          │
+      ┌───────────────▼──────────┐    ┌──────────▼──────────┐
+      │ Find compatible scaffold │    │      MotifGraft      │
+      │ loop (ep_len ≤ loop_len  │    │  Full backbone graft │
+      │     ± MAX_SIZE_DELTA)    │    │  via RosettaScripts  │
+      └──────────┬───────────────┘    └──────────┬──────────┘
+                 │                               │
+        ┌────────▼────────┐             ┌────────▼────────┐
+        │  Loop found?    │             │  graft_method:  │
+        └──┬──────────┬───┘             │   MOTIFGRAFT    │
+        YES│          │NO               └─────────────────┘
+           │          │
+┌──────────▼───────┐  └──► FAILED_NO_LOOP
+│ Mutate sequence  │
+│ → CCD closure    │
+│ → FastRelax      │
+└──────────┬───────┘
+           │
+   ┌───────▼────────┐
+   │ graft_method:  │
+   │   LOOP_MODEL   │
+   └────────────────┘
+```
+
+**Path A — structured epitope (HELIX / SHEET / MIXED):** PyRosetta's `MotifGraft` mover searches the scaffold for backbone segments that geometrically match the epitope's N- and C-terminal anchors, then grafts the full epitope backbone. The scaffold's 3D geometry changes.
+
+**Path B — loop epitope (LOOP):** A full backbone graft is overkill for flexible loops. GRAFFITI finds an existing scaffold loop of compatible length, mutates its sequence residue-by-residue to match the epitope, then runs CCD to close chain breaks and FastRelax to resolve clashes. Backbone movement is minimal.
+
+This logic lives in `ss_utils.py` and is shared by both worker modules.
+
+---
+
+## Requirements
+
+- Python ≥ 3.8
+- [PyRosetta](https://www.pyrosetta.org/) (licensed, install separately)
+- NumPy
+- Matplotlib
+- [ProteinMPNN](https://github.com/dauparas/ProteinMPNN) (for Step 3)
+
+Install Python dependencies:
+
+```bash
+pip install numpy matplotlib
+```
+
+PyRosetta requires a separate license and installation — see [pyrosetta.org](https://www.pyrosetta.org/downloads).
 
 ---
 
@@ -22,179 +111,151 @@ The goal is to find scaffolds that can accommodate the maximum number of epitope
 
 ```
 project/
-├── scaffolds_to_test/          # Input scaffold PDB files
-├── Epitopes/                   # Input motif/epitope PDB files
-├── Grafts_individual/          # Phase 1 output: individual graft PDBs + map CSV
-├── Grafts_optimized/
-│   ├── final_pdbs/             # Phase 2 output: multi-motif grafted structures
-│   ├── overlap_decisions_*.csv # KEEP/REMOVE decision per (scaffold, motif)
-│   ├── scaffold_ranking_*.csv  # Scaffolds ranked by compatible motif count
-│   ├── sasa_per_residue_*.csv  # Per-residue SASA for all final poses
-│   ├── ranking_chart_*.png     # Bar chart: motifs kept vs removed per scaffold
-│   ├── distribution_chart_*.png# Histogram: scaffolds by number of compatible motifs
-│   └── overlap_heatmap_*.png   # Conflict matrix for the most contested scaffold
-├── phase1_independent_grafting.py
-└── phase2_overlap_analysis.py
+├── graffiti_run.py        # Unified pipeline runner
+├── step1_paralel.py       # Phase 1 orchestrator
+├── step2.py               # Phase 2 orchestrator
+├── phase1_worker.py       # Per-pair grafting worker
+├── phase2_worker.py       # Per-scaffold cumulative grafting worker
+├── ss_utils.py            # DSSP classification + loop modeling utilities
+│
+├── few_dummies/           # Input scaffold PDBs
+├── Epitopes/              # Input epitope PDBs
+├── Grafts_individual/     # Step 1 output (PDBs + graft_map CSV)
+├── Grafts_optimized/      # Step 2 output (final PDBs, SASA CSVs, rankings)
+├── MPNN_out/              # Step 3 output (designed sequences)
+├── AlphaFold_results/     # Step 4 input (run externally)
+└── AF2_analysis/          # Step 5 output (pLDDT, RMSD, SASA analysis)
 ```
-
----
-
-## Requirements
-
-- Python 3.8+
-- [PyRosetta](https://www.pyrosetta.org/) (licensed separately)
-- `matplotlib`
-- `numpy`
-
-Install Python dependencies:
-```bash
-pip install matplotlib numpy
-```
-
-> PyRosetta requires an academic or commercial license. See [pyrosetta.org](https://www.pyrosetta.org/downloads) for installation instructions.
 
 ---
 
 ## Usage
 
-### Phase 1 — Independent Grafting
-
-Tests every `(scaffold, motif)` pair in isolation. Each scaffold is reloaded fresh for every attempt, so results are fully independent.
+### Run full pipeline
 
 ```bash
-python phase1_independent_grafting.py
+python graffiti_run.py --steps 1 2 3
 ```
 
-**Configure** at the top of the script:
-```python
-scaffold_dir = "scaffolds_to_test/"
-epitopes_dir = "Epitopes/"
-output_dir   = "Grafts_individual/"
-```
-
-**Output:** `Grafts_individual/graft_map_TIMESTAMP.csv`
-
-| Column | Description |
-|---|---|
-| `scaffold_id` | Scaffold name (without `.pdb`) |
-| `motif_name` | Motif filename |
-| `status` | `SUCCESS` or `FAILED` |
-| `scaffold_range_start` | First Rosetta index of the grafted region |
-| `scaffold_range_end` | Last Rosetta index of the grafted region |
-| `pdb_chain` | Chain of the inserted motif |
-| `pdb_start_resnum` / `pdb_end_resnum` | PDB residue numbers of the motif |
-| `motif_size` | Number of residues in the motif |
-| `sequence` | Amino acid sequence inserted |
-| `connection_resnums` | Junction residues (N-/C-terminal connections) |
-
----
-
-### Phase 2 — Overlap Analysis, Optimization & SASA
-
-Reads the Phase 1 CSV, resolves conflicts, generates final PDBs, and computes SASA.
+### Resume from Step 2 (grafting already done)
 
 ```bash
-python phase2_overlap_analysis.py
+python graffiti_run.py --steps 2 3
 ```
 
-**Configure** at the top of the execution section:
-```python
-OVERLAP_BUFFER = 0   # Safety margin in residues (0 = any overlap counts)
-scaffold_dir   = "scaffolds_to_test/"
-epitopes_dir   = "Epitopes/"
-output_dir     = "Grafts_optimized/"
+### Run post-AF2 analysis only
+
+```bash
+python graffiti_run.py --steps 5
 ```
 
-Increasing `OVERLAP_BUFFER` allows small gaps between motifs to be tolerated — useful when scaffold flexibility may accommodate closely spaced grafts.
+### Override config on the command line
+
+```bash
+python graffiti_run.py --steps 1 2 3 --cpus 16 --top_percent 10
+```
+
+### Dry run (print config and exit)
+
+```bash
+python graffiti_run.py --dry_run
+```
 
 ---
 
-## How the Overlap Optimization Works
+## Configuration
 
-For each scaffold, Phase 2 runs a **greedy selection** algorithm:
+All defaults live in the `CFG` dict at the top of `graffiti_run.py`. Every key can be overridden via CLI flag.
 
-1. All successfully grafted motifs for that scaffold are sorted by range size (smallest first).
-2. Motifs are accepted one by one. A candidate is rejected if its `scaffold_range` overlaps with any already-accepted motif.
-3. The result is the largest set of non-overlapping motifs for that scaffold.
-
-This approach prioritizes smaller motifs (less invasive to scaffold structure) and maximizes the total count of compatible grafts.
+| Key | Default | Description |
+|-----|---------|-------------|
+| `scaffolds_dir` | `few_dummies/` | Input scaffold PDB directory |
+| `epitopes_dir` | `Epitopes/` | Input epitope PDB directory |
+| `grafts_dir` | `Grafts_individual/` | Step 1 output directory |
+| `optimized_dir` | `Grafts_optimized/` | Step 2 output directory |
+| `cpus` | 8 | Parallel workers for Step 1 |
+| `overlap_buffer` | 0 | Residue margin between graft ranges |
+| `top_percent` | 20 | % of top scaffolds carried to Step 3 |
+| `min_grafts` | `None` (auto) | Minimum grafts to pass filter |
+| `n_workers_step2` | 8 | Workers for Step 2 PDB generation |
+| `mpnn_num_seq` | 10 | Sequences per scaffold (ProteinMPNN) |
+| `mpnn_temp` | `0.2` | ProteinMPNN sampling temperature |
+| `rmsd_threshold` | 2.0 Å | Epitope RMSD cutoff for quality flag |
+| `plddt_threshold` | 70.0 | Minimum pLDDT for quality flag |
 
 ---
 
-## Output Files
+## Step 1 in isolation
 
-### CSVs
+```bash
+python step1_paralel.py \
+  --scaffolds my_scaffolds/ \
+  --epitopes  my_epitopes/ \
+  --output    Grafts_individual/ \
+  --cpus      8
+```
 
-| File | Contents |
-|---|---|
-| `graft_map_*.csv` | Phase 1 raw results — all pairs, success/failure, residue ranges |
-| `overlap_decisions_*.csv` | Phase 2 per-pair decisions (`KEEP` / `REMOVE`) with conflict attribution |
-| `scaffold_ranking_*.csv` | Scaffolds ranked by number of compatible motifs |
-| `sasa_per_residue_*.csv` | Per-residue SASA (Å²) for every final grafted pose |
+Outputs a timestamped `graft_map_YYYYMMDD_HHMMSS.csv` with one row per pair, recording graft method, scaffold range, sequence, and SASA.
 
-### SASA CSV Schema
+---
+
+## Step 2 in isolation
+
+```bash
+python step2.py \
+  --phase1_csv    Grafts_individual/graft_map_*.csv \
+  --scaffolds_dir few_dummies/ \
+  --epitopes_dir  Epitopes/ \
+  --output_dir    Grafts_optimized/ \
+  --top_percent   20
+```
+
+Outputs:
+- `final_pdbs/` — all resolved scaffold PDBs
+- `top{N}pct_sasa/` — top % by mean epitope SASA
+- `max{N}grafts/` — scaffolds with maximum compatible grafts
+- `sasa_per_residue_*.csv` — per-residue SASA table
+- `scaffold_ranking_*.csv` — ranked scaffold summary
+- `distribution_chart_*.png` — motif count distribution plot
+
+---
+
+## Key Parameters in `ss_utils.py`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `LOOP_FRACTION` | 0.6 | Coil fraction threshold to classify as LOOP |
+| `MAX_SIZE_DELTA` | 5 | Max length difference (scaffold loop vs epitope) |
+| `FLANK_RESIDUES` | 3 | Flanking residues included in CCD/relax |
+| `CCD_CYCLES` | 200 | CCD loop closure iterations |
+| `RELAX_ROUNDS` | 0 | FastRelax rounds (0 = minimal) |
+
+---
+
+## Multiprocessing Notes
+
+PyRosetta is not fork-safe due to C++ global state. Both Step 1 and Step 2 use `multiprocessing.get_context("spawn")` so each worker initialises its own clean PyRosetta instance. This is handled automatically — no user action required.
+
+---
+
+## Output CSV Columns (Step 1)
 
 | Column | Description |
-|---|---|
-| `scaffold_id` | Scaffold name |
-| `motifs_applied` | Semicolon-separated list of applied motifs |
-| `total_sasa` | Total SASA of the full pose (Å²) |
-| `rosetta_index` | Internal Rosetta residue index (1-based) |
-| `pdb_resnum` | PDB residue number |
-| `chain` | Chain identifier |
-| `resname` | 3-letter amino acid name |
-| `aa_1letter` | 1-letter amino acid code |
-| `region` | `MOTIF`, `SCAFFOLD`, `CONNECTION`, or `HOTSPOT` |
-| `sasa` | Per-residue SASA (Å²) |
-
-Filtering `region == MOTIF` isolates the SASA values of the grafted epitopes, which can be used as a downstream metric to assess epitope surface exposure — a key parameter for immunogenicity predictions.
-
-### Plots
-
-| File | Description |
-|---|---|
-
-| `distribution_chart_*.png` | Histogram of scaffolds by number of compatible motifs |
-
-
----
-
-## MotifGraft Parameters
-
-Both scripts use the following MotifGraft settings, which can be adjusted directly in `xmlobject_MotifGrafting()`:
-
-| Parameter | Default | Description |
-|---|---|---|
-| `RMSD_tolerance` | `3.0` Å | Maximum backbone RMSD for fragment alignment |
-| `NC_points_RMSD_tolerance` | `10.0` Å | Maximum RMSD at N-/C-terminal junction points |
-| `clash_score_cutoff` | `5` | Maximum tolerated atomic clashes |
-| `clash_test_residue` | `GLY` | Residue used for clash testing (GLY = smallest) |
-| `full_motif_bb_alignment` | `1` | Full backbone alignment (requires exact fragment size match) |
-
----
-
-## Design Decisions & Notes
-
-**Why test pairs independently in Phase 1?**
-Grafting is sensitive to scaffold geometry. Testing each motif in isolation gives a clean, unbiased picture of where each epitope can land before any accumulation effects interfere.
-
-**Why greedy and not exhaustive search?**
-With many motifs and scaffolds, exhaustive search of all non-overlapping subsets is NP-hard. The greedy approach (smallest-first) is fast, interpretable, and performs well in practice for typical epitope counts (< 20).
-
-**Why is SASA computed on the final pose only?**
-SASA is context-dependent — the presence of other grafted motifs can bury or expose neighboring residues. Computing it on the final multi-motif structure gives the most realistic estimate of epitope accessibility.
-
-**Why keep the labels from MotifGraft?**
-Rosetta automatically labels residues as `MOTIF`, `SCAFFOLD`, `CONNECTION`, `CONTEXT`, and `HOTSPOT` after grafting. These labels persist in the pose and are used throughout the pipeline to identify regions without re-parsing PDB files.
-
----
-
-## Reference
-
-Silva, D., Correia, B.E., and Procko, E. (2016) *Motif-driven Design of Protein-Protein Interactions.* Methods Mol. Biol. 1414:285–304.
+|--------|-------------|
+| `scaffold_id` | Scaffold PDB stem |
+| `motif_name` | Epitope filename |
+| `status` | `SUCCESS` / `FAILED` / `FAILED_NO_LOOP` |
+| `graft_method` | `MOTIFGRAFT` / `LOOP_MODEL` / `FAILED_NO_LOOP` |
+| `epitope_ss_class` | `HELIX` / `SHEET` / `LOOP` / `MIXED` |
+| `scaffold_range_start` | Rosetta start index of graft |
+| `scaffold_range_end` | Rosetta end index of graft |
+| `motif_size` | Epitope length (residues) |
+| `sequence` | Grafted sequence (one-letter) |
+| `scaffold_total_residues` | Total scaffold residues |
+| `error_message` | Failure reason (empty on success) |
 
 ---
 
 ## License
 
-This project is released under the MIT License. Note that PyRosetta itself is subject to its own separate licensing terms.
+This project uses PyRosetta, which requires a separate academic or commercial license from the [Rosetta Commons](https://www.pyrosetta.org/downloads#academic). All other code in this repository is released under the MIT License.
