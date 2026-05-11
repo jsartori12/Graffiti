@@ -2,6 +2,7 @@
 <div align="center">
   <img src="grafiti-removebg-preview.png" width="400" />
 </div>
+
 **G**rafting **R**outine for **A**utomated **F**ragment **F**itting, **I**nsertion, and **T**argeted **I**mmunogenic epitopes
 
 A PyRosetta pipeline for transplanting immunogenic epitopes onto protein scaffolds, with secondary-structure-aware grafting, SASA-based ranking, and ProteinMPNN sequence design.
