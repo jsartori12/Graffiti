@@ -38,7 +38,7 @@ Epitopes  (PDB) ─┘
 Epitopes are classified by DSSP into **HELIX**, **SHEET**, **LOOP**, or **MIXED**. The classification drives two completely different grafting strategies:
 
 <div align="center">
-  <img src="Figures/schemegrafting.png" width="700" />
+  <img src="Figures/text25.png" width="700" />
 </div>
 
 ```
