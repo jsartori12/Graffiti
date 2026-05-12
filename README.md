@@ -41,51 +41,6 @@ Epitopes are classified by DSSP into **HELIX**, **SHEET**, **LOOP**, or **MIXED*
   <img src="Figures/text25.png" width="700" />
 </div>
 
-```
-                    ┌─────────────────────────────┐
-                    │   Scaffold + epitope PDB     │
-                    │   (one job per worker)       │
-                    └──────────────┬──────────────┘
-                                   │
-                    ┌──────────────▼──────────────┐
-                    │      DSSP classification     │
-                    │  Count H (helix), E (sheet), │
-                    │  L (coil) residues via DSSP  │
-                    └──────────────┬──────────────┘
-                                   │
-                      ┌────────────▼────────────┐
-                      │    ≥ 60% coil residues? │
-                      │   (LOOP_FRACTION = 0.6) │
-                      └──────┬──────────┬───────┘
-                          YES │          │ NO
-                              │          │
-               ┌──────────────▼─┐   ┌───▼──────────────────┐
-               │  LOOP epitope  │   │  HELIX / SHEET / MIXED│
-               └──────┬─────────┘   └───────────┬───────────┘
-                      │                          │
-      ┌───────────────▼──────────┐    ┌──────────▼──────────┐
-      │ Find compatible scaffold │    │      MotifGraft      │
-      │ loop (ep_len ≤ loop_len  │    │  Full backbone graft │
-      │     ± MAX_SIZE_DELTA)    │    │  via RosettaScripts  │
-      └──────────┬───────────────┘    └──────────┬──────────┘
-                 │                               │
-        ┌────────▼────────┐             ┌────────▼────────┐
-        │  Loop found?    │             │  graft_method:  │
-        └──┬──────────┬───┘             │   MOTIFGRAFT    │
-        YES│          │NO               └─────────────────┘
-           │          │
-┌──────────▼───────┐  └──► FAILED_NO_LOOP
-│ Mutate sequence  │
-│ → CCD closure    │
-│ → FastRelax      │
-└──────────┬───────┘
-           │
-   ┌───────▼────────┐
-   │ graft_method:  │
-   │   LOOP_MODEL   │
-   └────────────────┘
-```
-
 **Path A — structured epitope (HELIX / SHEET / MIXED):** PyRosetta's `MotifGraft` mover searches the scaffold for backbone segments that geometrically match the epitope's N- and C-terminal anchors, then grafts the full epitope backbone. The scaffold's 3D geometry changes.
 
 **Path B — loop epitope (LOOP):** A full backbone graft is overkill for flexible loops. GRAFFITI finds an existing scaffold loop of compatible length, mutates its sequence residue-by-residue to match the epitope, then runs CCD to close chain breaks and FastRelax to resolve clashes. Backbone movement is minimal.
