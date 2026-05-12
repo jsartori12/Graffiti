@@ -43,7 +43,7 @@ Epitopes are classified by DSSP into **HELIX**, **SHEET**, **LOOP**, or **MIXED*
 
 **Path A — structured epitope (HELIX / SHEET / MIXED):** PyRosetta's `MotifGraft` mover searches the scaffold for backbone segments that geometrically match the epitope's N- and C-terminal anchors, then grafts the full epitope backbone. The scaffold's 3D geometry changes.
 
-**Path B — loop epitope (LOOP):** A full backbone graft is overkill for flexible loops. GRAFFITI finds an existing scaffold loop of compatible length, mutates its sequence residue-by-residue to match the epitope, then runs CCD to close chain breaks and FastRelax to resolve clashes. Backbone movement is minimal.
+**Path B — loop epitope (LOOP):** A full backbone graft is overkill for flexible loops. GRAFFITI finds an existing scaffold loop of compatible length, mutates its sequence residue-by-residue to match the epitope, then runs Repacking.
 
 This logic lives in `ss_utils.py` and is shared by both worker modules.
 
